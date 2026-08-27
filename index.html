@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<title>Funds Ledger</title>
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Ledger">
+<meta name="theme-color" content="#f3f2f2">
+<link rel="stylesheet" href="styles.css">
+<style>
+  /* Georgia fallback so the app stays readable if the Google Fonts request fails. */
+  :root {
+    --font-heading: "Source Serif 4", Georgia, serif;
+    --font-body: "Source Serif 4", Georgia, serif;
+  }
+  a { color: var(--color-accent); }
+  a:hover { color: var(--color-accent-600); }
+  select.input { appearance: auto; }
+
+  .shell { max-width: 560px; margin: 0 auto; padding: 28px 20px 70px; }
+  @media (min-width: 920px) {
+    .shell.shell-home { max-width: 1060px; padding: 48px 40px 80px; }
+    .shell-home .home-grid { display: grid; grid-template-columns: 360px 1fr; gap: 72px; align-items: start; }
+    .shell-home .home-left { position: sticky; top: 48px; }
+  }
+
+  .reg-row {
+    display: flex; align-items: center; gap: 14px; padding: 13px 0;
+    border-bottom: 1px solid color-mix(in srgb, var(--color-text) 8%, transparent);
+  }
+  .row-check {
+    width: 44px; height: 44px; flex: none; border-radius: 3px; cursor: pointer;
+    font-size: 24px; line-height: 1; display: flex; align-items: center; justify-content: center;
+    padding: 0; border: 1.5px solid var(--color-neutral-400); background: transparent; color: var(--color-bg);
+  }
+  .row-check.checked { border-color: var(--color-accent-600); background: var(--color-accent-600); }
+  .row-open {
+    flex: 1; min-width: 0; display: flex; align-items: center; gap: 12px;
+    background: none; border: none; padding: 0; cursor: pointer; font: inherit;
+    text-align: left; color: inherit; border-radius: 2px;
+  }
+  .row-payee { font-size: 16px; font-weight: 600; font-family: var(--font-heading); line-height: 1.25; }
+  .row-meta { font-size: 13px; color: var(--color-neutral-600); margin-top: 2px; }
+  .row-right { text-align: right; flex: none; }
+  .row-amt { font-family: var(--font-heading); font-weight: 600; font-size: 16px; white-space: nowrap; color: var(--color-text); }
+  .row-amt.in { color: var(--color-accent-700); }
+  .row-sub { font-size: 12px; margin-top: 2px; color: var(--color-neutral-600); }
+  .row-sub.saving { color: var(--color-accent-2-700); font-style: italic; }
+  .row-retry {
+    display: block; background: none; border: none; padding: 6px 0 6px 12px; margin: -6px 0;
+    cursor: pointer; font: inherit; text-align: right; color: inherit; border-radius: 2px; min-height: 44px;
+  }
+  .row-retry .row-sub { color: var(--color-accent-2-700); }
+
+  .payee-opt {
+    display: flex; justify-content: space-between; align-items: baseline; gap: 12px; width: 100%;
+    min-height: 52px; padding: 12px 14px; border-radius: 2px; cursor: pointer; font: inherit;
+    text-align: left; color: inherit; border: 1px solid var(--color-divider); background: var(--color-surface);
+  }
+  .payee-opt.picked { border: 1.5px solid var(--color-accent); background: var(--color-accent-100); }
+
+  .sum-row {
+    display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 13px 0;
+    border-bottom: 1px solid color-mix(in srgb, var(--color-text) 8%, transparent);
+  }
+</style>
+</head>
+<body>
+<noscript><p style="max-width:560px;margin:40px auto;padding:0 20px">This ledger needs JavaScript turned on to work.</p></noscript>
+<div id="app"></div>
+<script>
+'use strict';
+
+/* ── Configuration ─────────────────────────────────────────────────────── */
+const API_URL = 'PASTE_APPS_SCRIPT_EXEC_URL_HERE';   // the /exec URL from the Apps Script web-app deployment
+const AUTH_KEY = 'assistance-ledger-auth';           // localStorage: sha256 hex of passphrase
+const MIRROR_KEY = 'assistance-ledger-v1';           // localStorage: entries[] mirror
+
+const apiConfigured = /^https:\/\//.test(API_URL);
+
+/* ── API client ────────────────────────────────────────────────────────── */
+class AuthError extends Error {}
+
+function getAuth() {
+  try { return localStorage.getItem(AUTH_KEY) || sessionStorage.getItem(AUTH_KEY); } catch (e) { return null; }
+}
+function clearAuth() {
+  try { localStorage.removeItem(AUTH_KEY); sessionStorage.removeItem(AUTH_KEY); } catch (e) {}
+}
+
+async function api(action, payload = {}) {
+  const auth = getAuth();
+  const res = await fetch(API_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain' },   // NOT application/json — a preflighted request fails against Apps Script
+    body: JSON.stringify({ auth, action, ...payload }),
+  });
+  const data = await res.json();
+  if (data.error === 'unauthorized') { clearAuth(); throw new AuthError(); }
+  if (data.error) throw new Error(data.error);
+  return data;
+}
+
+async function sha256Hex(text) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+/* ── State ─────────────────────────────────────────────────────────────── */
+function loadMirror() {
+  try {
+    const v = JSON.parse(localStorage.getItem(MIRROR_KEY));
+    return Array.isArray(v) ? v : [];
+  } catch (e) { return []; }
+}
+
+const state = {
+  entries: loadMirror(),
+  locked: !getAuth(),
+  screen: 'home',                 // home | form | summary
+  bucket: 'restricted',
+  form: null,
+  confirmDelete: false,
+  summaryMonth: null,
+  passError: '',                  // '' | 'wrong' | 'network'
+  unlocking: false,
+  rememberDevice: true,
+};
+
+const pendingOps = new Map();     // entry id -> retry thunk for a failed write
+
+/* saving/failed are client-only flags; strip them before the mirror or the API. */
+function stripLocal(e) { const { saving, failed, ...rest } = e; return rest; }
+function writeMirror() {
+  try { localStorage.setItem(MIRROR_KEY, JSON.stringify(state.entries.map(stripLocal))); } catch (e) {}
+}
+
+/* ── Formatting helpers ────────────────────────────────────────────────── */
+/* Every user-entered string is escaped through esc() before it reaches markup. */
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const fmt = n => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(n);
+function monthLabel(ym) { const [y, m] = ym.split('-').map(Number); return new Date(y, m - 1, 1).toLocaleDateString('en-US', { month: 'long', year: 'numeric' }); }
+function shortDate(d) { return new Date(d + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }); }
+function ym(date) { return date.toISOString().slice(0, 7); }
+function ymAdd(base, delta) { const [y, m] = base.split('-').map(Number); const d = new Date(y, m - 1 + delta, 1); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0'); }
+function parseAmount(s) { const n = parseFloat(String(s).replace(/[$,\s]/g, '')); return (isFinite(n) && n > 0) ? Math.round(n * 100) / 100 : null; }
+const signed = e => e.type === 'deposit' ? e.amount : -e.amount;
+const isLocalId = id => String(id).startsWith('local-');
+
+/* ── Sync: server round trips ──────────────────────────────────────────── */
+async function refreshFromServer() {
+  if (!apiConfigured || state.locked) return;
+  try {
+    const data = await api('list');
+    // Keep entries with a write in flight or a failed write; the server list doesn't know about them yet.
+    const holdIds = new Set(state.entries.filter(e => e.saving || e.failed).map(e => e.id));
+    const held = state.entries.filter(e => holdIds.has(e.id));
+    state.entries = data.entries.filter(e => !holdIds.has(e.id)).concat(held);
+    writeMirror();
+    render();
+  } catch (err) {
+    if (err instanceof AuthError) { state.locked = true; render(); }
+    // Other failures are silent: the mirror is already on screen and writes carry their own retry UI.
+  }
+}
+
+function failOp(id, err, thunk) {
+  pendingOps.set(id, thunk);
+  state.entries = state.entries.map(e => e.id === id ? { ...e, saving: false, failed: true } : e);
+  writeMirror();
+  if (err instanceof AuthError) { state.locked = true; }
+  render();
+}
+
+function retryOp(id) {
+  const thunk = pendingOps.get(id);
+  if (!thunk) return;
+  state.entries = state.entries.map(e => e.id === id ? { ...e, saving: true, failed: false } : e);
+  render();
+  thunk();
+}
+
+async function performCreate(localId) {
+  const local = state.entries.find(e => e.id === localId);
+  if (!local) return;
+  const payload = stripLocal({ ...local });
+  delete payload.id;
+  try {
+    const { entry } = await api('create', { entry: payload });
+    state.entries = state.entries.map(e => e.id === localId ? entry : e);
+    pendingOps.delete(localId);
+    writeMirror();
+    render();
+    refreshFromServer();
+  } catch (err) {
+    failOp(localId, err, () => performCreate(localId));
+  }
+}
+
+async function performUpdate(id) {
+  const local = state.entries.find(e => e.id === id);
+  if (!local) return;
+  try {
+    const { entry } = await api('update', { entry: stripLocal({ ...local }) });
+    state.entries = state.entries.map(e => e.id === id ? entry : e);
+    pendingOps.delete(id);
+    writeMirror();
+    render();
+    refreshFromServer();
+  } catch (err) {
+    failOp(id, err, () => performUpdate(id));
+  }
+}
+
+async function performDelete(id) {
+  try {
+    await api('delete', { id });
+    pendingOps.delete(id);
+    state.entries = state.entries.map(e => e.id === id ? { ...e, active: false, saving: false, failed: false } : e);
+    writeMirror();
+    render();
+    refreshFromServer();
+  } catch (err) {
+    // Bring the row back so the retry note has somewhere to live.
+    state.entries = state.entries.map(e => e.id === id ? { ...e, active: true } : e);
+    failOp(id, err, () => performDelete(id));
+  }
+}
+
+/* ── Actions ───────────────────────────────────────────────────────────── */
+async function tryUnlock() {
+  if (state.unlocking) return;
+  const input = document.getElementById('pass-input');
+  const raw = input ? input.value : '';
+  if (!raw.trim()) { setPassError('wrong'); return; }
+  state.unlocking = true;
+  setUnlockBusy(true);
+  // Match is case/whitespace-insensitive: hash the trimmed, lowercased phrase.
+  const hash = await sha256Hex(raw.trim().toLowerCase());
+  try {
+    if (state.rememberDevice) { localStorage.setItem(AUTH_KEY, hash); sessionStorage.removeItem(AUTH_KEY); }
+    else { sessionStorage.setItem(AUTH_KEY, hash); localStorage.removeItem(AUTH_KEY); }
+  } catch (e) {}
+  try {
+    const data = await api('list');
+    state.entries = data.entries;
+    writeMirror();
+    state.locked = false;
+    state.passError = '';
+    state.unlocking = false;
+    render();
+  } catch (err) {
+    state.unlocking = false;
+    setUnlockBusy(false);
+    setPassError(err instanceof AuthError ? 'wrong' : 'network');
+  }
+}
+
+function lock() {
+  clearAuth();
+  Object.assign(state, { locked: true, screen: 'home', form: null, confirmDelete: false, passError: '', unlocking: false });
+  render();
+}
+
+function openDeposit() {
+  const cur = ym(new Date());
+  const bucket = state.bucket;
+  state.screen = 'form';
+  state.form = {
+    id: null, type: 'deposit', bucket, date: cur + '-01', serviceMonth: cur,
+    amount: '', note: '', payee: monthLabel(cur) + ' ' + bucket + ' deposit',
+  };
+  render();
+  // Deposit amount is always blank — she reads it off the funding letter — so put the caret there.
+  setTimeout(() => { const el = document.getElementById('f-amount'); if (el) el.focus(); }, 60);
+}
+
+function openPayment() {
+  const now = new Date();
+  const cur = ym(now);
+  const bucket = state.bucket;
+  state.screen = 'form';
+  state.form = {
+    id: null, type: 'payment', bucket, date: now.toISOString().slice(0, 10),
+    serviceMonth: bucket === 'restricted' ? ymAdd(cur, -1) : cur,
+    amount: '', note: '', payee: '',
+  };
+  render();
+}
+
+function openEdit(e) {
+  state.screen = 'form';
+  state.form = {
+    id: e.id, type: e.type, bucket: e.bucket, date: e.date, serviceMonth: e.serviceMonth,
+    amount: e.amount.toFixed(2), note: e.note || '', payee: e.payee,
+  };
+  render();
+}
+
+function goHome() {
+  Object.assign(state, { screen: 'home', form: null, confirmDelete: false });
+  render();
+}
+
+function submitForm() {
+  const f = state.form;
+  const amount = parseAmount(f.amount);
+  if (!amount || !f.payee.trim()) return;
+  if (!f.id) {
+    const localId = 'local-' + Date.now() + '-' + Math.floor(Math.random() * 1e6);
+    state.entries.push({
+      id: localId, bucket: f.bucket, date: f.date, type: f.type, payee: f.payee.trim(),
+      amount, serviceMonth: f.serviceMonth, cleared: false, note: f.note, active: true, saving: true,
+    });
+    writeMirror();
+    Object.assign(state, { screen: 'home', bucket: f.bucket, form: null });
+    render();
+    performCreate(localId);
+  } else {
+    const id = f.id;
+    state.entries = state.entries.map(e => e.id === id
+      ? { ...e, type: f.type, bucket: f.bucket, date: f.date, serviceMonth: f.serviceMonth, amount, note: f.note, payee: f.payee.trim(), saving: true, failed: false }
+      : e);
+    writeMirror();
+    Object.assign(state, { screen: 'home', bucket: f.bucket, form: null });
+    render();
+    // An entry that never reached the server still needs a create, even from the edit form.
+    if (isLocalId(id)) performCreate(id); else performUpdate(id);
+  }
+}
+
+function toggleCleared(id) {
+  const e0 = state.entries.find(e => e.id === id);
+  if (!e0 || e0.saving || e0.failed) return;   // mid-save rows settle first; failed rows retry first
+  state.entries = state.entries.map(e => e.id === id ? { ...e, cleared: !e.cleared, saving: true } : e);
+  writeMirror();
+  render();
+  if (isLocalId(id)) performCreate(id); else performUpdate(id);
+}
+
+function doDelete() {
+  const id = state.form && state.form.id;
+  Object.assign(state, { confirmDelete: false, screen: 'home', form: null });
+  if (isLocalId(id)) {
+    // Never reached the server — just drop it locally.
+    state.entries = state.entries.filter(e => e.id !== id);
+    pendingOps.delete(id);
+    writeMirror();
+    render();
+    return;
+  }
+  state.entries = state.entries.map(e => e.id === id ? { ...e, active: false } : e);
+  writeMirror();
+  render();
+  performDelete(id);
+}
+
+/* ── Derivations ───────────────────────────────────────────────────────── */
+function derive() {
+  const active = state.entries.filter(e => e.active !== false);
+  const inBucket = active.filter(e => e.bucket === state.bucket);
+  const balance = inBucket.reduce((a, e) => a + signed(e), 0);
+  const cleared = inBucket.filter(e => e.cleared).reduce((a, e) => a + signed(e), 0);
+
+  const sorted = inBucket.slice().sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
+  let run = 0;
+  const rows = sorted.map(e => { run += signed(e); return { e, run }; }).reverse();
+
+  const monthSet = new Set(active.map(e => e.serviceMonth));
+  const cur = ym(new Date());
+  for (let i = 1; i >= -9; i--) monthSet.add(ymAdd(cur, i));
+  const monthOptions = Array.from(monthSet).sort().reverse();
+
+  const seen = new Map();
+  active.filter(e => e.type === 'payment').sort((a, b) => a.date < b.date ? 1 : -1)
+    .forEach(e => { if (!seen.has(e.payee)) seen.set(e.payee, e.amount); });
+  const payeeOptions = Array.from(seen.entries()).slice(0, 4);
+
+  const bucketMonths = Array.from(new Set(inBucket.map(e => e.serviceMonth))).sort().reverse();
+  const summaryMonth = state.summaryMonth || bucketMonths[0] || cur;
+  const sumEntries = inBucket.filter(e => e.serviceMonth === summaryMonth)
+    .sort((a, b) => a.type === b.type ? (a.date < b.date ? -1 : 1) : (a.type === 'deposit' ? -1 : 1));
+  const carry = sumEntries.reduce((a, e) => a + signed(e), 0);
+
+  return { balance, cleared, rows, monthOptions, payeeOptions, summaryMonth, sumEntries, carry };
+}
+
+/* ── Rendering ─────────────────────────────────────────────────────────── */
+const app = document.getElementById('app');
+
+function render() {
+  if (state.locked) { renderLock(); return; }
+  if (state.screen === 'form') { renderForm(); return; }
+  if (state.screen === 'summary') { renderSummary(); return; }
+  renderHome();
+}
+
+function setPassError(kind) {
+  state.passError = kind;
+  const el = document.getElementById('pass-error');
+  if (!el) return;
+  el.style.display = kind ? '' : 'none';
+  el.textContent = kind === 'network'
+    ? "Can't reach the ledger right now. Check the internet connection and try again."
+    : "That's not the passphrase. Check it and try again.";
+}
+
+function setUnlockBusy(busy) {
+  const btn = document.getElementById('unlock-btn');
+  if (!btn) return;
+  btn.disabled = busy;
+  btn.textContent = busy ? 'Opening…' : 'Open the ledger';
+}
+
+function renderLock() {
+  app.innerHTML = `
+  <div style="min-height:100vh;background:var(--color-bg)"><div class="shell">
+    <div style="padding-top:12vh">
+      <h1 style="font-size:36px;margin:0 0 6px">Funds Ledger</h1>
+      <p class="text-muted" style="font-size:15px;margin-bottom:30px">Type the passphrase to open the ledger.</p>
+      <div class="field" style="margin-bottom:16px">
+        <label for="pass-input" style="font-size:14px">Passphrase</label>
+        <input id="pass-input" class="input" type="password" autocomplete="current-password" style="min-height:56px;font-size:20px">
+      </div>
+      <label class="radio" style="margin-bottom:24px;min-height:44px">
+        <input id="remember" type="checkbox" ${state.rememberDevice ? 'checked' : ''}><span class="dot" style="border-radius:3px"></span>Remember me on this phone or computer
+      </label>
+      <button id="unlock-btn" class="btn btn-primary btn-block" style="min-height:58px;font-size:17px">Open the ledger</button>
+      <p id="pass-error" style="display:none;font-size:15px;color:var(--color-accent-2-700);margin-top:14px"></p>
+      ${apiConfigured ? '' : `<p class="text-muted" style="font-size:13px;margin-top:30px">Setup note: the Apps Script web-app URL hasn't been pasted into index.html yet, so the ledger can't connect.</p>`}
+    </div>
+  </div></div>`;
+  const input = document.getElementById('pass-input');
+  input.addEventListener('keydown', ev => { if (ev.key === 'Enter') tryUnlock(); });
+  input.addEventListener('input', () => setPassError(''));
+  document.getElementById('remember').addEventListener('change', ev => { state.rememberDevice = ev.target.checked; });
+  document.getElementById('unlock-btn').addEventListener('click', tryUnlock);
+  if (state.passError) setPassError(state.passError);
+  input.focus();
+}
+
+function renderHome() {
+  const d = derive();
+  const bucketLabel = state.bucket === 'restricted' ? 'Restricted' : 'Unrestricted';
+
+  const rowsHtml = d.rows.map(({ e, run }) => {
+    const isDep = e.type === 'deposit';
+    const amt = `<div class="row-amt${isDep ? ' in' : ''}">${isDep ? '+ ' : '− '}${fmt(e.amount)}</div>`;
+    const right = e.failed
+      ? `<button class="row-retry" data-retry="${esc(e.id)}" aria-label="Didn't save: ${esc(e.payee)} ${fmt(e.amount)}. Tap to retry.">
+           ${amt}<div class="row-sub">Didn't save — tap to retry</div>
+         </button>`
+      : `<div class="row-right">
+           ${amt}<div class="row-sub${e.saving ? ' saving' : ''}">${e.saving ? 'Saving…' : 'balance ' + fmt(run)}</div>
+         </div>`;
+    return `
+    <div class="reg-row">
+      <button class="row-check${e.cleared ? ' checked' : ''}" data-check="${esc(e.id)}"
+        aria-label="${e.cleared ? 'Cleared: ' : 'Not cleared yet: '}${esc(e.payee)} ${fmt(e.amount)}. Tap to change.">${e.cleared ? '✓' : ''}</button>
+      <button class="row-open" data-open="${esc(e.id)}">
+        <div style="flex:1;min-width:0">
+          <div class="row-payee">${esc(e.payee)}</div>
+          <div class="row-meta">${shortDate(e.date)} · for ${monthLabel(e.serviceMonth)}</div>
+        </div>
+      </button>
+      ${right}
+    </div>`;
+  }).join('');
+
+  app.innerHTML = `
+  <div style="min-height:100vh;background:var(--color-bg)"><div class="shell shell-home">
+    <div class="home-grid">
+      <div class="home-left">
+        <header style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:26px">
+          <h1 style="font-size:36px;margin:0">Funds Ledger</h1>
+          <button id="lock-btn" class="btn btn-ghost" style="min-height:44px">Lock</button>
+        </header>
+        <div class="seg" style="display:flex;width:100%;margin-bottom:30px">
+          <label class="seg-opt" style="flex:1;justify-content:center;min-height:50px;font-size:16px">
+            <input type="radio" name="bucket" value="restricted" ${state.bucket === 'restricted' ? 'checked' : ''}>Restricted
+          </label>
+          <label class="seg-opt" style="flex:1;justify-content:center;min-height:50px;font-size:16px">
+            <input type="radio" name="bucket" value="unrestricted" ${state.bucket === 'unrestricted' ? 'checked' : ''}>Unrestricted
+          </label>
+        </div>
+        <div style="margin-bottom:30px">
+          <div style="font-size:12px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-neutral-600)">${bucketLabel} balance</div>
+          <div style="font-size:56px;font-family:var(--font-heading);font-weight:600;line-height:1.05;letter-spacing:-0.02em;margin-top:4px">${fmt(d.balance)}</div>
+          <div style="font-size:15px;color:var(--color-neutral-700);margin-top:8px">Cleared at the bank: <strong>${fmt(d.cleared)}</strong></div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:36px">
+          <button id="add-deposit" class="btn btn-primary" style="min-height:60px;font-size:16px">Money came in</button>
+          <button id="add-payment" class="btn btn-secondary" style="min-height:60px;font-size:16px">I paid something</button>
+        </div>
+      </div>
+      <div>
+        <div style="display:flex;align-items:baseline;justify-content:space-between;gap:12px">
+          <h6 style="margin:0">Register</h6>
+          <button id="open-summary" class="btn btn-ghost" style="min-height:44px">Month summary</button>
+        </div>
+        <p style="font-size:13px;color:var(--color-neutral-600);margin:2px 0 6px">Tap the box when the bank shows it. Tap an entry to change it.</p>
+        ${d.rows.length
+          ? `<div>${rowsHtml}</div>`
+          : `<p class="text-muted" style="font-size:15px;padding:18px 0 0">Nothing in this ledger yet. Use the two buttons above when money comes in or goes out.</p>`}
+      </div>
+    </div>
+  </div></div>`;
+
+  document.getElementById('lock-btn').addEventListener('click', lock);
+  document.getElementById('add-deposit').addEventListener('click', openDeposit);
+  document.getElementById('add-payment').addEventListener('click', openPayment);
+  document.getElementById('open-summary').addEventListener('click', () => { state.screen = 'summary'; state.summaryMonth = null; render(); });
+  app.querySelectorAll('input[name="bucket"]').forEach(el =>
+    el.addEventListener('change', () => { state.bucket = el.value; render(); }));
+  app.querySelectorAll('[data-check]').forEach(el =>
+    el.addEventListener('click', () => toggleCleared(el.dataset.check)));
+  app.querySelectorAll('[data-open]').forEach(el =>
+    el.addEventListener('click', () => { const e = state.entries.find(x => x.id === el.dataset.open); if (e) openEdit(e); }));
+  app.querySelectorAll('[data-retry]').forEach(el =>
+    el.addEventListener('click', () => retryOp(el.dataset.retry)));
+}
+
+function renderForm() {
+  const d = derive();
+  const f = state.form;
+  const isEdit = !!f.id;
+  const amount = parseAmount(f.amount);
+  const title = isEdit ? 'Change this entry' : (f.type === 'deposit' ? 'Money came in' : 'I paid something');
+  const hint = isEdit ? 'Fix anything below, then save.'
+    : (f.type === 'deposit'
+      ? 'Type the amount from the funding letter. Everything else is filled in for you.'
+      : 'Pick who you paid and check the amount.');
+
+  const payeePicker = f.type === 'payment' ? `
+    <div class="field" style="margin-bottom:22px">
+      <label style="font-size:14px">Who did you pay?</label>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        ${d.payeeOptions.map(([name, last], i) => `
+          <button class="payee-opt${f.payee === name ? ' picked' : ''}" data-payee="${i}">
+            <span style="font-size:16px;font-family:var(--font-heading);font-weight:600">${esc(name)}</span>
+            <span style="font-size:13px;color:var(--color-neutral-700)">Last time ${fmt(last)}</span>
+          </button>`).join('')}
+      </div>
+      <input id="f-payee" class="input" style="min-height:50px;font-size:16px;margin-top:8px" placeholder="Or type a name here" value="${esc(f.payee)}">
+    </div>` : '';
+
+  const description = f.type === 'deposit' ? `
+    <div class="field" style="margin-bottom:22px">
+      <label for="f-payee" style="font-size:14px">Description</label>
+      <input id="f-payee" class="input" style="min-height:50px;font-size:16px" value="${esc(f.payee)}">
+    </div>` : '';
+
+  const saveLabel = amount ? 'Save — ' + fmt(amount) : (f.type === 'deposit' ? 'Save deposit' : 'Save payment');
+
+  app.innerHTML = `
+  <div style="min-height:100vh;background:var(--color-bg)"><div class="shell">
+    <button id="back-btn" class="btn btn-ghost" style="margin:-6px 0 16px -5px;font-size:15px;min-height:44px">‹ Back to the ledger</button>
+    <h2 style="font-size:28px;margin-bottom:4px">${title}</h2>
+    <p class="text-muted" style="font-size:14px;margin-bottom:26px">${hint}</p>
+    ${payeePicker}
+    <div class="field" style="margin-bottom:22px">
+      <label for="f-amount" style="font-size:14px">How much?</label>
+      <div style="display:flex;align-items:center;gap:10px">
+        <span style="font-size:30px;font-family:var(--font-heading);font-weight:600">$</span>
+        <input id="f-amount" class="input" inputmode="decimal" placeholder="0.00" value="${esc(f.amount)}"
+          style="font-size:30px;min-height:60px;font-family:var(--font-heading);font-weight:600">
+      </div>
+    </div>
+    ${description}
+    <div class="field" style="margin-bottom:22px">
+      <label for="f-month" style="font-size:14px">Which month is this money for?</label>
+      <select id="f-month" class="input" style="min-height:50px;font-size:16px">
+        ${d.monthOptions.map(v => `<option value="${v}" ${v === f.serviceMonth ? 'selected' : ''}>${monthLabel(v)}</option>`).join('')}
+      </select>
+    </div>
+    <div class="field" style="margin-bottom:22px">
+      <label for="f-date" style="font-size:14px">Date</label>
+      <input id="f-date" type="date" class="input" style="min-height:50px;font-size:16px" value="${esc(f.date)}">
+    </div>
+    <div class="field" style="margin-bottom:22px">
+      <label style="font-size:14px">Which pot of money?</label>
+      <div class="seg" style="display:flex;width:100%">
+        <label class="seg-opt" style="flex:1;justify-content:center;min-height:48px;font-size:15px">
+          <input type="radio" name="fbucket" value="restricted" ${f.bucket === 'restricted' ? 'checked' : ''}>Restricted
+        </label>
+        <label class="seg-opt" style="flex:1;justify-content:center;min-height:48px;font-size:15px">
+          <input type="radio" name="fbucket" value="unrestricted" ${f.bucket === 'unrestricted' ? 'checked' : ''}>Unrestricted
+        </label>
+      </div>
+    </div>
+    <div class="field" style="margin-bottom:28px">
+      <label for="f-note" style="font-size:14px">Note (optional)</label>
+      <input id="f-note" class="input" style="min-height:50px;font-size:16px" value="${esc(f.note)}">
+    </div>
+    <button id="save-btn" class="btn btn-primary btn-block" style="min-height:58px;font-size:17px" ${(!amount || !f.payee.trim()) ? 'disabled' : ''}>${saveLabel}</button>
+    ${isEdit ? `<button id="delete-btn" class="btn btn-ghost btn-block" style="min-height:50px;color:var(--color-accent-2-700);margin-top:10px">Remove this entry</button>` : ''}
+  </div></div>
+  ${state.confirmDelete ? renderDialog(f, amount) : ''}`;
+
+  const updateSaveBtn = () => {
+    const a = parseAmount(state.form.amount);
+    const btn = document.getElementById('save-btn');
+    btn.disabled = !a || !state.form.payee.trim();
+    btn.textContent = a ? 'Save — ' + fmt(a) : (state.form.type === 'deposit' ? 'Save deposit' : 'Save payment');
+  };
+
+  document.getElementById('back-btn').addEventListener('click', goHome);
+  document.getElementById('f-amount').addEventListener('input', ev => { state.form.amount = ev.target.value; updateSaveBtn(); });
+  document.getElementById('f-payee').addEventListener('input', ev => { state.form.payee = ev.target.value; updateSaveBtn(); });
+  document.getElementById('f-month').addEventListener('change', ev => { state.form.serviceMonth = ev.target.value; });
+  document.getElementById('f-date').addEventListener('change', ev => { state.form.date = ev.target.value; });
+  document.getElementById('f-note').addEventListener('input', ev => { state.form.note = ev.target.value; });
+  app.querySelectorAll('input[name="fbucket"]').forEach(el =>
+    el.addEventListener('change', () => { state.form.bucket = el.value; }));
+  app.querySelectorAll('[data-payee]').forEach(el =>
+    el.addEventListener('click', () => {
+      const [name, last] = d.payeeOptions[Number(el.dataset.payee)];
+      state.form.payee = name;
+      state.form.amount = last.toFixed(2);
+      render();
+    }));
+  document.getElementById('save-btn').addEventListener('click', submitForm);
+  const del = document.getElementById('delete-btn');
+  if (del) del.addEventListener('click', () => { state.confirmDelete = true; render(); });
+  if (state.confirmDelete) {
+    document.getElementById('dlg-keep').addEventListener('click', () => { state.confirmDelete = false; render(); });
+    document.getElementById('dlg-remove').addEventListener('click', doDelete);
+  }
+}
+
+function renderDialog(f, amount) {
+  return `
+  <div class="dialog-backdrop" style="z-index:50">
+    <div class="dialog" role="alertdialog" aria-labelledby="dlg-title">
+      <div class="dialog-title" id="dlg-title">Remove this entry?</div>
+      <div class="dialog-body">${esc(f.payee || '')} — ${amount ? fmt(amount) : ''}</div>
+      <div class="dialog-actions">
+        <button id="dlg-keep" class="btn btn-secondary" style="min-height:46px">Keep it</button>
+        <button id="dlg-remove" class="btn btn-primary" style="min-height:46px;background:var(--color-accent-2-600)">Remove</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+function renderSummary() {
+  const d = derive();
+  const bucketLabel = state.bucket === 'restricted' ? 'Restricted' : 'Unrestricted';
+  const rows = d.sumEntries.map(e => `
+    <div class="sum-row">
+      <div style="min-width:0">
+        <div style="font-size:15px;font-family:var(--font-heading);font-weight:600">${esc(e.payee)}</div>
+        <div style="font-size:13px;color:var(--color-neutral-600)">${e.type === 'deposit' ? 'Deposit, arrived ' : 'Paid '}${shortDate(e.date)}${e.cleared ? ' · cleared' : ' · not cleared yet'}</div>
+      </div>
+      <div class="row-amt${e.type === 'deposit' ? ' in' : ''}">${e.type === 'deposit' ? '+ ' : '− '}${fmt(e.amount)}</div>
+    </div>`).join('');
+
+  app.innerHTML = `
+  <div style="min-height:100vh;background:var(--color-bg)"><div class="shell">
+    <button id="back-btn" class="btn btn-ghost" style="margin:-6px 0 16px -5px;font-size:15px;min-height:44px">‹ Back to the ledger</button>
+    <h2 style="font-size:28px;margin-bottom:4px">Month summary</h2>
+    <p class="text-muted" style="font-size:14px;margin-bottom:22px">${bucketLabel} money, by the month it was for. July's bills are usually paid in August.</p>
+    <select id="sum-month" class="input" style="min-height:50px;font-size:16px;margin-bottom:14px">
+      ${d.monthOptions.map(v => `<option value="${v}" ${v === d.summaryMonth ? 'selected' : ''}>${monthLabel(v)}</option>`).join('')}
+    </select>
+    <div>${rows}</div>
+    <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;padding:16px 0">
+      <div style="font-size:16px;font-family:var(--font-heading);font-weight:600">Left over from this month</div>
+      <div style="font-size:20px;font-family:var(--font-heading);font-weight:600">${fmt(d.carry)}</div>
+    </div>
+    ${d.sumEntries.length ? '' : `<p class="text-muted" style="font-size:15px">No entries for this month yet.</p>`}
+  </div></div>`;
+
+  document.getElementById('back-btn').addEventListener('click', goHome);
+  document.getElementById('sum-month').addEventListener('change', ev => { state.summaryMonth = ev.target.value; render(); });
+}
+
+/* ── Boot: render the mirror instantly, then reconcile with the sheet ──── */
+render();
+refreshFromServer();
+</script>
+</body>
+</html>
