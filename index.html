@@ -86,10 +86,13 @@ const apiConfigured = /^https:\/\//.test(API_URL);
 /* ── API client ────────────────────────────────────────────────────────── */
 class AuthError extends Error {}
 
+let authMem = null;   // in-memory fallback so a storage-blocked browser (private tab) still works for the session
 function getAuth() {
+  if (authMem) return authMem;
   try { return localStorage.getItem(AUTH_KEY) || sessionStorage.getItem(AUTH_KEY); } catch (e) { return null; }
 }
 function clearAuth() {
+  authMem = null;
   try { localStorage.removeItem(AUTH_KEY); sessionStorage.removeItem(AUTH_KEY); } catch (e) {}
 }
 
@@ -240,13 +243,14 @@ async function tryUnlock() {
   if (!raw.trim()) { setPassError('wrong'); return; }
   state.unlocking = true;
   setUnlockBusy(true);
-  // Match is case/whitespace-insensitive: hash the trimmed, lowercased phrase.
-  const hash = await sha256Hex(raw.trim().toLowerCase());
   try {
-    if (state.rememberDevice) { localStorage.setItem(AUTH_KEY, hash); sessionStorage.removeItem(AUTH_KEY); }
-    else { sessionStorage.setItem(AUTH_KEY, hash); localStorage.removeItem(AUTH_KEY); }
-  } catch (e) {}
-  try {
+    // Match is case/whitespace-insensitive: hash the trimmed, lowercased phrase.
+    const hash = await sha256Hex(raw.trim().toLowerCase());
+    authMem = hash;
+    try {
+      if (state.rememberDevice) { localStorage.setItem(AUTH_KEY, hash); sessionStorage.removeItem(AUTH_KEY); }
+      else { sessionStorage.setItem(AUTH_KEY, hash); localStorage.removeItem(AUTH_KEY); }
+    } catch (e) {}
     const data = await api('list');
     state.entries = data.entries;
     writeMirror();
